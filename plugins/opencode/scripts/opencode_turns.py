@@ -139,12 +139,8 @@ def ensure_turn_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS turns_session_index_idx ON turns (session_id, turn_index)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS turns_session_time_idx ON turns (session_id, end_time, turn_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS turns_session_index_idx ON turns (session_id, turn_index)")
+    conn.execute("CREATE INDEX IF NOT EXISTS turns_session_time_idx ON turns (session_id, end_time, turn_id)")
     conn.commit()
 
 
@@ -160,7 +156,9 @@ def load_turn_state(conn: sqlite3.Connection, session_id: str) -> TurnState:
     ).fetchone()
 
     if row is None:
-        return TurnState(session_id=session_id, last_completed_time=0, last_completed_message_id="", last_completed_turn_id="")
+        return TurnState(
+            session_id=session_id, last_completed_time=0, last_completed_message_id="", last_completed_turn_id=""
+        )
 
     return TurnState(
         session_id=row["session_id"],
@@ -264,9 +262,7 @@ def load_messages(
 
     if after_time is not None:
         if after_message_id:
-            query.append(
-                "AND (time_created > ? OR (time_created = ? AND id > ?))"
-            )
+            query.append("AND (time_created > ? OR (time_created = ? AND id > ?))")
             params.extend([after_time, after_time, after_message_id])
         else:
             query.append("AND time_created > ?")
@@ -309,13 +305,162 @@ def extract_message_text(conn: sqlite3.Connection, message_id: str) -> str:
     return combined
 
 
+def session_has_v2_rows(conn: sqlite3.Connection, session_id: str) -> bool:
+    """Return True if this session has any rows in OpenCode v2's session_message table."""
+    try:
+        return (
+            conn.execute("SELECT 1 FROM session_message WHERE session_id = ? LIMIT 1", (session_id,)).fetchone()
+            is not None
+        )
+    except sqlite3.OperationalError:  # v1-only database: table absent
+        return False
+
+
+def _v2_text(data: dict) -> str:
+    """Render a v2 session_message row's data into readable text."""
+    if isinstance(data.get("text"), str):
+        return data["text"].strip()
+    parts = data.get("content") or []
+    return "\n".join(
+        str(p["text"]).strip()
+        for p in parts
+        if isinstance(p, dict) and p.get("type") == "text" and p.get("text") and not p.get("synthetic")
+    ).strip()
+
+
+def _build_turns_v2(
+    conn: sqlite3.Connection,
+    session_id: str,
+    after_message_id: str | None = None,
+) -> list[OpenCodeTurn]:
+    """Group OpenCode v2 session_message rows into turns, ordered by seq.
+
+    Vendor rule: v2 chronology is session_message.seq; timestamps may collide
+    or move backwards, so seq (not time_created) drives both ordering and
+    cursor resumption.
+    """
+    after_seq = None
+    if after_message_id:
+        row = conn.execute(
+            "SELECT seq FROM session_message WHERE session_id = ? AND id = ?",
+            (session_id, after_message_id),
+        ).fetchone()
+        after_seq = row[0] if row else None  # unknown cursor: replay the session; capture anchors dedupe
+
+    query = (
+        "SELECT id, type, data, time_created FROM session_message "
+        "WHERE session_id = ? AND type IN ('user', 'assistant')"
+    )
+    params: list[object] = [session_id]
+    if after_seq is not None:
+        query += " AND seq > ?"
+        params.append(after_seq)
+    rows = conn.execute(query + " ORDER BY seq ASC", tuple(params)).fetchall()
+
+    turns: list[OpenCodeTurn] = []
+    current: OpenCodeTurn | None = None
+    last_finish: str | None = None
+
+    for row in rows:
+        row_type = row["type"]
+        try:
+            data = json.loads(row["data"])
+        except Exception:
+            data = {}
+
+        time_created = int(row["time_created"])
+
+        if row_type == "user":
+            # Any user row ends the previous turn, whether or not this one is
+            # readable or has text — otherwise a malformed/textless user row
+            # is invisible and the next assistant answer (meant for it) gets
+            # misattributed onto the previous turn.
+            if current is not None:
+                current.complete = last_finish is not None and last_finish != "tool-calls"
+                turns.append(current)
+            current = None
+            last_finish = None
+
+            text = _v2_text(data)
+            if not text:
+                continue
+
+            message = OpenCodeMessage(
+                id=row["id"],
+                role="user",
+                parent_id=None,
+                time_created=time_created,
+                finish=None,
+                text=text,
+            )
+            current = OpenCodeTurn(
+                session_id=session_id,
+                turn_id=message.id,
+                turn_index=len(turns) + 1,
+                start_time=message.time_created,
+                end_time=message.time_created,
+                first_message_id=message.id,
+                last_message_id=message.id,
+                message_count=1,
+                assistant_message_count=0,
+                complete=False,
+                messages=[message],
+            )
+            continue
+
+        # role == "assistant"
+        if current is None:
+            continue
+
+        last_finish = data.get("finish")
+        current.last_message_id = row["id"]
+        current.end_time = time_created
+
+        text = _v2_text(data)
+        if not text:
+            continue
+
+        message = OpenCodeMessage(
+            id=row["id"],
+            role="assistant",
+            parent_id=None,
+            time_created=time_created,
+            finish=last_finish,
+            text=text,
+        )
+        current.messages.append(message)
+        current.message_count += 1
+        current.assistant_message_count += 1
+
+    if current is not None:
+        current.complete = last_finish is not None and last_finish != "tool-calls"
+        turns.append(current)
+
+    for index, turn in enumerate(turns, start=1):
+        turn.turn_index = index
+
+    return turns
+
+
 def build_turns(
     conn: sqlite3.Connection,
     session_id: str,
     after_time: int | None = None,
     after_message_id: str | None = None,
 ) -> list[OpenCodeTurn]:
-    """Group OpenCode messages into turns."""
+    """Group OpenCode messages into turns, dispatching to v1 or v2 storage."""
+    if session_has_v2_rows(conn, session_id):
+        return _build_turns_v2(conn, session_id, after_message_id)
+    return build_turns_legacy(conn, session_id, after_time=after_time, after_message_id=after_message_id)
+
+
+def build_turns_legacy(
+    conn: sqlite3.Connection,
+    session_id: str,
+    after_time: int | None = None,
+    after_message_id: str | None = None,
+) -> list[OpenCodeTurn]:
+    """Group OpenCode v1 (legacy message/part tables) messages into turns."""
     rows = load_messages(conn, session_id, after_time=after_time, after_message_id=after_message_id)
 
     turns: list[OpenCodeTurn] = []

@@ -511,32 +511,50 @@ def process_is_alive(pid: int) -> bool:
     return True
 
 
-def get_session_ids(conn: sqlite3.Connection, project_dir: str) -> list[str]:
-    """Find OpenCode sessions that belong to the given project directory."""
-    sessions = conn.execute(
-        """
-        SELECT s.id
-        FROM session s
-        WHERE s.directory = ?
-        ORDER BY s.time_updated DESC
-        LIMIT 5
-        """,
-        (project_dir,),
-    ).fetchall()
+def get_session_ids(conn: sqlite3.Connection, project_dir: str, limit: int = 5) -> list[str]:
+    """Find OpenCode sessions that belong to the given project directory.
 
+    Sessions can appear in the legacy `session` table, OpenCode v2's
+    `session_v2` table, or both (same id). Each session is ranked once by
+    its newest activity across either table. `session_v2` may not exist on
+    older OpenCode installs, so that half of the union is guarded and the
+    query degrades to legacy-only on sqlite3.OperationalError.
+    """
+
+    def _query(condition: str, param: str) -> list[str]:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT id, MAX(t) AS t FROM (
+                    SELECT id, time_updated AS t FROM session WHERE directory {condition}
+                    UNION ALL
+                    SELECT id, time_updated AS t FROM session_v2 WHERE directory {condition}
+                )
+                GROUP BY id
+                ORDER BY t DESC
+                LIMIT ?
+                """,
+                (param, param, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                f"""
+                SELECT id, MAX(t) AS t FROM (
+                    SELECT id, time_updated AS t FROM session WHERE directory {condition}
+                )
+                GROUP BY id
+                ORDER BY t DESC
+                LIMIT ?
+                """,
+                (param, limit),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    sessions = _query("= ?", project_dir)
     if not sessions:
-        sessions = conn.execute(
-            """
-            SELECT s.id
-            FROM session s
-            WHERE s.directory LIKE ?
-            ORDER BY s.time_updated DESC
-            LIMIT 5
-            """,
-            (f"%{os.path.basename(project_dir)}%",),
-        ).fetchall()
+        sessions = _query("LIKE ?", f"%{os.path.basename(project_dir)}%")
 
-    return [row[0] for row in sessions]
+    return sessions
 
 
 def _load_legacy_last_msg_time(project_dir: str) -> int:
@@ -846,10 +864,7 @@ def main() -> None:
                 )
 
             if any_new:
-                os.system(
-                    f"{args.memsearch_cmd} index '{memory_dir}' "
-                    f"--default-collection {args.collection_name} &"
-                )
+                os.system(f"{args.memsearch_cmd} index '{memory_dir}' --default-collection {args.collection_name} &")
                 wake_maintenance(args.project_dir)
         except Exception:
             pass

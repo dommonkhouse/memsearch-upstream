@@ -81,7 +81,7 @@ sequenceDiagram
 
 Step by step:
 
-1. **Poll SQLite** -- queries the `session` and `message` tables for the current project directory, looking for messages newer than the last completed turn cursor
+1. **Poll SQLite** -- queries the `session` and `message` tables for the current project directory, looking for messages newer than the last completed turn cursor. On OpenCode installs that have moved to the newer `session_message` table (v2 storage), the reader groups turns from that table instead.
 2. **Group into turns** -- groups each `user` message with its assistant/tool descendants until the next `user` message
 3. **Extract text** -- reads message text into a readable format and skips raw tool parts
 4. **Summarize** -- calls `opencode run` with the turn text and a third-person summarization prompt

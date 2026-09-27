@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -460,6 +461,497 @@ def _insert_message(
                 ),
             ),
         )
+
+
+def _create_session_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            directory TEXT NOT NULL,
+            time_updated INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def _insert_session(conn: sqlite3.Connection, session_id: str, directory: str, time_updated: int) -> None:
+    conn.execute(
+        "INSERT INTO session (id, directory, time_updated) VALUES (?, ?, ?)",
+        (session_id, directory, time_updated),
+    )
+    conn.commit()
+
+
+def _insert_session_v2(conn: sqlite3.Connection, session_id: str, directory: str, time_updated: int) -> None:
+    conn.execute(
+        "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?, ?, ?)",
+        (session_id, directory, time_updated),
+    )
+    conn.commit()
+
+
+def _make_v2_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY,
+            directory TEXT NOT NULL,
+            time_updated INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def _insert_v2(
+    conn: sqlite3.Connection,
+    session_id: str,
+    seq: int,
+    type_: str,
+    data: dict,
+    time_created: int,
+    msg_id: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (msg_id, session_id, type_, seq, time_created, time_created, json.dumps(data)),
+    )
+    conn.commit()
+
+
+def test_build_turns_v2_groups_user_and_assistant_by_seq(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_v2_seq"
+
+    # Inserted out of time_created order but in seq order: seq must drive grouping, not time.
+    _insert_v2(conn, session_id, 1, "user", {"text": "First question"}, 500, "u1")
+    _insert_v2(
+        conn,
+        session_id,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "First answer"}], "finish": "stop"},
+        100,
+        "a1",
+    )
+    _insert_v2(conn, session_id, 3, "user", {"text": "Second question"}, 50, "u2")
+    _insert_v2(
+        conn,
+        session_id,
+        4,
+        "assistant",
+        {"content": [{"type": "text", "text": "Second answer"}], "finish": "stop"},
+        900,
+        "a2",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, session_id)
+
+    assert len(turns) == 2
+    assert turns[0].turn_id == "u1"
+    assert [m.id for m in turns[0].messages] == ["u1", "a1"]
+    assert turns[1].turn_id == "u2"
+    assert [m.id for m in turns[1].messages] == ["u2", "a2"]
+    assert turns[0].complete is True
+    assert turns[1].complete is True
+
+    conn.close()
+
+
+def test_build_turns_v2_skips_non_turn_rows_and_tool_parts(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_v2_skip"
+
+    _insert_v2(conn, session_id, 1, "user", {"text": "Investigate"}, 100, "u1")
+    _insert_v2(conn, session_id, 2, "system", {"text": "system banner"}, 110, "sys1")
+    _insert_v2(conn, session_id, 3, "synthetic", {"text": "synthetic note"}, 115, "syn1")
+    _insert_v2(conn, session_id, 4, "idle", {"text": "idle"}, 118, "idle1")
+    _insert_v2(
+        conn,
+        session_id,
+        5,
+        "assistant",
+        {
+            "content": [{"type": "tool", "tool": "Bash"}, {"type": "text", "text": "Found it"}],
+            "finish": "stop",
+        },
+        120,
+        "a1",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, session_id)
+
+    assert len(turns) == 1
+    assert [m.id for m in turns[0].messages] == ["u1", "a1"]
+    rendered = turns[0].render()
+    assert "Found it" in rendered
+    assert "system banner" not in rendered
+    assert "synthetic note" not in rendered
+    assert "[Tool:" not in rendered
+
+    conn.close()
+
+
+def test_build_turns_v2_completeness(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_v2_complete"
+
+    _insert_v2(conn, session_id, 1, "user", {"text": "Q1"}, 100, "u1")
+    _insert_v2(
+        conn,
+        session_id,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Working"}], "finish": "tool-calls"},
+        110,
+        "a1",
+    )
+
+    _insert_v2(conn, session_id, 3, "user", {"text": "Q2"}, 200, "u2")
+    _insert_v2(
+        conn,
+        session_id,
+        4,
+        "assistant",
+        {"content": [{"type": "text", "text": "No finish set"}]},
+        210,
+        "a2",
+    )
+
+    _insert_v2(conn, session_id, 5, "user", {"text": "Q3"}, 300, "u3")
+    _insert_v2(
+        conn,
+        session_id,
+        6,
+        "assistant",
+        {"content": [{"type": "text", "text": "Done"}], "finish": "stop"},
+        310,
+        "a3",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, session_id)
+
+    assert len(turns) == 3
+    assert turns[0].complete is False
+    assert turns[1].complete is False
+    assert turns[2].complete is True
+
+    conn.close()
+
+
+def test_build_turns_prefers_v2_when_session_has_v2_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+
+    dual_session = "ses_dual"
+    _insert_message(conn, "u1", dual_session, 100, "user", text="Legacy question")
+    _insert_message(conn, "a1", dual_session, 110, "assistant", parent_id="u1", finish="stop", text="Legacy answer")
+
+    _insert_v2(conn, dual_session, 1, "user", {"text": "Legacy question"}, 100, "u1")
+    _insert_v2(
+        conn,
+        dual_session,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Legacy answer"}], "finish": "stop"},
+        110,
+        "a1",
+    )
+    _insert_v2(conn, dual_session, 3, "user", {"text": "v2 only follow-up"}, 200, "u2")
+    _insert_v2(
+        conn,
+        dual_session,
+        4,
+        "assistant",
+        {"content": [{"type": "text", "text": "v2 only answer"}], "finish": "stop"},
+        210,
+        "a2",
+    )
+
+    legacy_session = "ses_legacy_only"
+    _insert_message(conn, "lu1", legacy_session, 100, "user", text="Legacy only question")
+    _insert_message(
+        conn, "la1", legacy_session, 110, "assistant", parent_id="lu1", finish="stop", text="Legacy only answer"
+    )
+    conn.commit()
+
+    dual_turns = build_turns(conn, dual_session)
+    legacy_turns = build_turns(conn, legacy_session)
+
+    assert [t.turn_id for t in dual_turns] == ["u1", "u2"]
+    assert len(legacy_turns) == 1
+    assert legacy_turns[0].turn_id == "lu1"
+
+    conn.close()
+
+
+def test_build_turns_legacy_only_db_without_v2_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)  # no v2 tables created at all
+    session_id = "ses_no_v2_tables"
+
+    _insert_message(conn, "u1", session_id, 100, "user", text="Question")
+    _insert_message(conn, "a1", session_id, 110, "assistant", parent_id="u1", finish="stop", text="Answer")
+    conn.commit()
+
+    turns = build_turns(conn, session_id)
+
+    assert len(turns) == 1
+    assert turns[0].turn_id == "u1"
+    assert turns[0].complete is True
+
+    conn.close()
+
+
+def test_build_turns_legacy_missing_finish_still_complete(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    session_id = "ses_legacy_no_finish"
+
+    _insert_message(conn, "u1", session_id, 100, "user", text="Question")
+    _insert_message(conn, "a1", session_id, 110, "assistant", parent_id="u1", finish=None, text="Answer")
+    conn.commit()
+
+    turns = build_turns(conn, session_id)
+
+    assert len(turns) == 1
+    assert turns[0].complete is True
+
+    conn.close()
+
+
+def test_build_turns_v2_resumes_by_seq_not_time(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_v2_seq_cursor"
+
+    # Turn A: seq 5-6, must not be returned once we resume past seq 10.
+    _insert_v2(conn, session_id, 5, "user", {"text": "Turn A question"}, 100, "uA")
+    _insert_v2(
+        conn,
+        session_id,
+        6,
+        "assistant",
+        {"content": [{"type": "text", "text": "Turn A answer"}], "finish": "stop"},
+        110,
+        "aA",
+    )
+
+    # Turn B: seq 9-10. Its assistant row (seq 10) is the saved cursor.
+    _insert_v2(conn, session_id, 9, "user", {"text": "Turn B question"}, 1_000_000, "uB")
+    _insert_v2(
+        conn,
+        session_id,
+        10,
+        "assistant",
+        {"content": [{"type": "text", "text": "Turn B answer"}], "finish": "stop"},
+        2_000_000,
+        "aB",
+    )
+
+    # Turn C: seq 11-12, time_created 10 minutes (600,000 ms) earlier than the cursor row.
+    # It must still be returned because chronology is seq, not time.
+    _insert_v2(conn, session_id, 11, "user", {"text": "Turn C question"}, 1_400_000, "uC")
+    _insert_v2(
+        conn,
+        session_id,
+        12,
+        "assistant",
+        {"content": [{"type": "text", "text": "Turn C answer"}], "finish": "stop"},
+        1_400_050,
+        "aC",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, session_id, after_message_id="aB")
+
+    assert [t.turn_id for t in turns] == ["uC"]
+
+    conn.close()
+
+
+def test_build_turns_v2_unknown_cursor_replays_session(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_v2_unknown_cursor"
+
+    _insert_v2(conn, session_id, 1, "user", {"text": "Question"}, 100, "u1")
+    _insert_v2(
+        conn,
+        session_id,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Answer"}], "finish": "stop"},
+        110,
+        "a1",
+    )
+    conn.commit()
+
+    # A cursor ID that exists in the legacy world but not in this session's session_message rows.
+    turns = build_turns(conn, session_id, after_message_id="legacy_only_id_not_in_v2")
+
+    assert [t.turn_id for t in turns] == ["u1"]
+
+    conn.close()
+
+
+def test_build_turns_v2_unreadable_user_row_does_not_merge_into_previous_turn(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+
+    # Case 1: a malformed-JSON user row between two real turns.
+    malformed_session = "ses_v2_malformed_user"
+    _insert_v2(conn, malformed_session, 1, "user", {"text": "Question one"}, 100, "u1")
+    _insert_v2(
+        conn,
+        malformed_session,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Answer one"}], "finish": "stop"},
+        110,
+        "a1",
+    )
+    conn.execute(
+        """
+        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (malformed_session + "_bad", malformed_session, "user", 3, 120, 120, "{not valid json"),
+    )
+    _insert_v2(
+        conn,
+        malformed_session,
+        4,
+        "assistant",
+        {"content": [{"type": "text", "text": "Answer two"}], "finish": "stop"},
+        130,
+        "a2",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, malformed_session)
+
+    assert len(turns) == 1
+    assert turns[0].turn_id == "u1"
+    assert [m.id for m in turns[0].messages] == ["u1", "a1"]
+    assert all(m.id != "a2" for t in turns for m in t.messages)
+
+    # Case 2: a valid-JSON but text-less user row (content is tool-only) between two real turns.
+    textless_session = "ses_v2_textless_user"
+    _insert_v2(conn, textless_session, 1, "user", {"text": "Question one"}, 100, "tu1")
+    _insert_v2(
+        conn,
+        textless_session,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Answer one"}], "finish": "stop"},
+        110,
+        "ta1",
+    )
+    _insert_v2(
+        conn,
+        textless_session,
+        3,
+        "user",
+        {"content": [{"type": "tool", "tool": "x"}]},
+        120,
+        "tu2_textless",
+    )
+    _insert_v2(
+        conn,
+        textless_session,
+        4,
+        "assistant",
+        {"content": [{"type": "text", "text": "Answer two"}], "finish": "stop"},
+        130,
+        "ta2",
+    )
+    conn.commit()
+
+    turns = build_turns(conn, textless_session)
+
+    assert len(turns) == 1
+    assert turns[0].turn_id == "tu1"
+    assert [m.id for m in turns[0].messages] == ["tu1", "ta1"]
+    assert all(m.id != "ta2" for t in turns for m in t.messages)
+
+    conn.close()
+
+
+def test_parse_transcript_reads_v2_session(tmp_path: Path) -> None:
+    """Regression guard: the transcript tool subprocess must read v2-only sessions.
+
+    Points get_db_path()'s default resolution (~/.local/share/opencode/opencode.db)
+    at a fake HOME so a v2-only database is picked up exactly the way the real
+    tool would find it, without ever touching the live database.
+    """
+    fake_home = tmp_path / "home"
+    db_dir = fake_home / ".local" / "share" / "opencode"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "opencode.db"
+
+    conn = _make_opencode_db(db_path)
+    _make_v2_tables(conn)
+    session_id = "ses_transcript_v2"
+    _insert_v2(conn, session_id, 1, "user", {"text": "What is the deployment plan?"}, 100, "u1")
+    _insert_v2(
+        conn,
+        session_id,
+        2,
+        "assistant",
+        {"content": [{"type": "text", "text": "Ship the v2 reader behind a feature flag."}], "finish": "stop"},
+        110,
+        "a1",
+    )
+    conn.commit()
+    conn.close()
+
+    env = os.environ.copy()
+    env["HOME"] = str(fake_home)
+    env.pop("XDG_DATA_HOME", None)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "parse-transcript.py"), session_id],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "What is the deployment plan?" in result.stdout
+    assert "Ship the v2 reader behind a feature flag." in result.stdout
 
 
 def test_build_turns_groups_multi_message_assistant_turns(tmp_path: Path) -> None:
@@ -1414,4 +1906,83 @@ def test_capture_session_turns_skips_summarizer_when_anchor_already_exists(
     assert content.count(f"<!-- session:{session_id} turn:u1 db:{db_path} -->") == 1
 
     turn_db.close()
+    conn.close()
+
+
+def test_get_session_ids_includes_v2_only_sessions(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _create_session_table(conn)
+    _make_v2_tables(conn)
+    project_dir = "/Users/alice/project"
+
+    _insert_session(conn, "legacy1", project_dir, 100)
+    _insert_session_v2(conn, "v2only1", project_dir, 200)
+
+    session_ids = capture_daemon.get_session_ids(conn, project_dir)
+
+    assert session_ids == ["v2only1", "legacy1"]
+
+    conn.close()
+
+
+def test_get_session_ids_respects_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _create_session_table(conn)
+    _make_v2_tables(conn)
+    project_dir = "/Users/alice/project"
+
+    for index in range(1, 7):
+        _insert_session(conn, f"s{index}", project_dir, index * 100)
+
+    session_ids = capture_daemon.get_session_ids(conn, project_dir, limit=3)
+
+    assert session_ids == ["s6", "s5", "s4"]
+
+    conn.close()
+
+
+def test_get_session_ids_promotes_shared_session_by_newest_time(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)
+    _create_session_table(conn)
+    _make_v2_tables(conn)
+    project_dir = "/Users/alice/project"
+
+    for index in range(1, 7):
+        _insert_session(conn, f"s{index}", project_dir, index * 100)
+
+    # s1 is the oldest of the six legacy sessions (time_updated=100), but it
+    # also has a session_v2 row with a much newer time_updated, so it must
+    # rank first by its newest activity across either table.
+    _insert_session_v2(conn, "s1", project_dir, 10_000)
+
+    session_ids = capture_daemon.get_session_ids(conn, project_dir)
+
+    assert session_ids == ["s1", "s6", "s5", "s4", "s3"]
+    assert session_ids.count("s1") == 1
+
+    conn.close()
+
+
+def test_get_session_ids_without_session_v2_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "opencode.db"
+    conn = _make_opencode_db(db_path)  # no session_v2 table created at all
+    _create_session_table(conn)
+    project_dir = "/Users/alice/project"
+
+    _insert_session(conn, "legacy1", project_dir, 100)
+    _insert_session(conn, "legacy2", project_dir, 200)
+    _insert_session(conn, "legacy3", "/archived/other-project-old", 300)
+
+    session_ids = capture_daemon.get_session_ids(conn, project_dir)
+
+    assert session_ids == ["legacy2", "legacy1"]
+
+    # The LIKE fallback (basename match) must also still work without session_v2.
+    fallback_ids = capture_daemon.get_session_ids(conn, "/Users/alice/other-project")
+
+    assert fallback_ids == ["legacy3"]
+
     conn.close()
